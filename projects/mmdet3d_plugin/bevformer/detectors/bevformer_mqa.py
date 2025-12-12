@@ -238,18 +238,30 @@ class BEVFormerMQA(MVXTwoStageDetector):
             bev_embed: [B, C, H, W] BEV feature map
         """
         # Use pts_bbox_head to get BEV features
-        bev_embed = self.pts_bbox_head(
-            img_feats, img_metas, prev_bev, only_bev=True)
-        
-        # Reshape from [B, H*W, C] to [B, C, H, W]
-        B = bev_embed.shape[0]
+        bev_embed = self.pts_bbox_head(img_feats, img_metas, prev_bev, only_bev=True)
+
         bev_h = self.pts_bbox_head.bev_h
         bev_w = self.pts_bbox_head.bev_w
-        C = bev_embed.shape[-1]
-        
-        bev_embed = bev_embed.permute(0, 2, 1).view(B, C, bev_h, bev_w)
-        
-        return bev_embed
+        hw = bev_h * bev_w
+
+        # Handle both possible layouts:
+        # - [B, HW, C]
+        # - [HW, B, C] (common in BEVFormer transformer)
+        if bev_embed.dim() != 3:
+            raise RuntimeError(f'Unexpected bev_embed shape: {tuple(bev_embed.shape)}')
+
+        if bev_embed.shape[0] == hw:
+            # [HW, B, C] -> [B, C, HW] -> [B, C, H, W]
+            B = bev_embed.shape[1]
+            C = bev_embed.shape[2]
+            bev_feat = bev_embed.permute(1, 2, 0).contiguous().view(B, C, bev_h, bev_w)
+        else:
+            # assume [B, HW, C]
+            B = bev_embed.shape[0]
+            C = bev_embed.shape[2]
+            bev_feat = bev_embed.permute(0, 2, 1).contiguous().view(B, C, bev_h, bev_w)
+
+        return bev_feat
     
     def forward(self, return_loss=True, **kwargs):
         """Forward function."""
@@ -257,6 +269,41 @@ class BEVFormerMQA(MVXTwoStageDetector):
             return self.forward_train(**kwargs)
         else:
             return self.forward_test(**kwargs)
+
+    def obtain_history_bev(self, imgs_queue, img_metas_list):
+        """Obtain history BEV features iteratively (no grad), like BEVFormer.
+
+        Args:
+            imgs_queue (Tensor): [B, T, N, C, H, W] where T is history length.
+            img_metas_list (list[list[dict]]): length B, each contains T meta dicts.
+
+        Returns:
+            Tensor | None: prev_bev features in shape [B, bev_h*bev_w, C] (encoder output).
+        """
+        if imgs_queue is None:
+            return None
+        if imgs_queue.dim() != 6:
+            return None
+
+        self.eval()
+        with torch.no_grad():
+            prev_bev = None
+            bs, len_queue, num_cams, C, H, W = imgs_queue.shape
+            if len_queue <= 0:
+                self.train()
+                return None
+
+            imgs_queue = imgs_queue.reshape(bs * len_queue, num_cams, C, H, W)
+            img_feats_list = self.extract_feat(img=imgs_queue, len_queue=len_queue)
+            for i in range(len_queue):
+                img_metas = [each[i] for each in img_metas_list]
+                if img_metas and isinstance(img_metas[0], dict) and not img_metas[0].get('prev_bev_exists', True):
+                    prev_bev = None
+                img_feats = [each_scale[:, i] for each_scale in img_feats_list]
+                prev_bev = self.pts_bbox_head(img_feats, img_metas, prev_bev, only_bev=True)
+
+            self.train()
+            return prev_bev
     
     @auto_fp16(apply_to=('img',))
     def forward_train(
@@ -302,12 +349,48 @@ class BEVFormerMQA(MVXTwoStageDetector):
             camera_prior_mask: [B, H, W] rule-based camera prior
         """
         losses = dict()
-        
+
+        prev_bev = None
+        # Support temporal input (like bevformer_small): img is [B, T, N, C, H, W]
+        if img is not None and img.dim() == 6:
+            len_queue = img.size(1)
+            prev_img = img[:, :-1, ...]
+            img = img[:, -1, ...]
+
+            prev_img_metas = copy.deepcopy(img_metas)
+            prev_bev = self.obtain_history_bev(prev_img, prev_img_metas)
+
+            img_metas = [each[len_queue - 1] for each in img_metas]
+            if img_metas and isinstance(img_metas[0], dict) and not img_metas[0].get('prev_bev_exists', True):
+                prev_bev = None
+
         # Extract image features
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
-        
-        # Get BEV features (no temporal for MQA single frame)
-        bev_feat = self.get_bev_features(img_feats, img_metas, prev_bev=None)
+
+        # 3D detection branch (same as BEVFormer): compute losses so transformer decoder params are used.
+        outs = self.pts_bbox_head(img_feats, img_metas, prev_bev)
+        loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
+        losses_pts = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
+        losses.update(losses_pts)
+
+        # BEV features for MQA
+        bev_embed = outs['bev_embed']
+        bev_h = self.pts_bbox_head.bev_h
+        bev_w = self.pts_bbox_head.bev_w
+        hw = bev_h * bev_w
+        if bev_embed.dim() != 3:
+            raise RuntimeError(f'Unexpected outs["bev_embed"] shape: {tuple(bev_embed.shape)}')
+
+        if bev_embed.shape[0] == hw:
+            # [HW, B, C]
+            B = bev_embed.shape[1]
+            C = bev_embed.shape[2]
+            bev_feat = bev_embed.permute(1, 2, 0).contiguous().view(B, C, bev_h, bev_w)
+        else:
+            # [B, HW, C]
+            B = bev_embed.shape[0]
+            C = bev_embed.shape[2]
+            bev_feat = bev_embed.permute(0, 2, 1).contiguous().view(B, C, bev_h, bev_w)
         
         # Encode question text
         # question is a list of strings
@@ -361,9 +444,38 @@ class BEVFormerMQA(MVXTwoStageDetector):
         # Handle batch dimension
         if not isinstance(img_metas[0], list):
             img_metas = [img_metas]
-        
+
+        prev_bev = self.prev_frame_info.get('prev_bev', None)
+        # reset prev bev when scene changes
+        if img_metas[0][0].get('scene_token', None) != self.prev_frame_info.get('scene_token', None):
+            prev_bev = None
+        self.prev_frame_info['scene_token'] = img_metas[0][0].get('scene_token', None)
+
+        # do not use temporal information
+        if not self.video_test_mode:
+            prev_bev = None
+
+        # update can_bus to delta pose (same logic as BEVFormer)
+        if img_metas[0] and isinstance(img_metas[0][0], dict) and 'can_bus' in img_metas[0][0]:
+            tmp_pos = copy.deepcopy(img_metas[0][0]['can_bus'][:3])
+            tmp_angle = copy.deepcopy(img_metas[0][0]['can_bus'][-1])
+            if prev_bev is not None:
+                img_metas[0][0]['can_bus'][:3] -= self.prev_frame_info['prev_pos']
+                img_metas[0][0]['can_bus'][-1] -= self.prev_frame_info['prev_angle']
+            else:
+                img_metas[0][0]['can_bus'][-1] = 0
+                img_metas[0][0]['can_bus'][:3] = 0
+        else:
+            tmp_pos = self.prev_frame_info.get('prev_pos', 0)
+            tmp_angle = self.prev_frame_info.get('prev_angle', 0)
+
         img_feats = self.extract_feat(img=img, img_metas=img_metas[0])
-        bev_feat = self.get_bev_features(img_feats, img_metas[0], prev_bev=None)
+        bev_feat = self.get_bev_features(img_feats, img_metas[0], prev_bev=prev_bev)
+
+        # store prev state
+        self.prev_frame_info['prev_pos'] = tmp_pos
+        self.prev_frame_info['prev_angle'] = tmp_angle
+        self.prev_frame_info['prev_bev'] = bev_feat.permute(0, 2, 3, 1).reshape(bev_feat.shape[0], -1, bev_feat.shape[1])
         
         # Encode text
         if isinstance(question, (list, tuple)):
