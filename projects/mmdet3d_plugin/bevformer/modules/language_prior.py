@@ -206,7 +206,7 @@ class PriorHead(BaseModule):
     def forward(
         self,
         text_embedding: torch.Tensor,
-        rule_prior: torch.Tensor = None,
+        rule_prior=None,
     ) -> torch.Tensor:
         """Generate spatial prior from text embedding.
         
@@ -230,6 +230,19 @@ class PriorHead(BaseModule):
         
         # Combine with rule prior if available
         if self.use_rule_prior and rule_prior is not None:
+            # Dataloader may provide rule_prior as a list (when not stacked).
+            # Normalize to a tensor of shape [B, H, W].
+            if isinstance(rule_prior, (list, tuple)):
+                if len(rule_prior) == 0:
+                    rule_prior = None
+                elif torch.is_tensor(rule_prior[0]):
+                    rule_prior = torch.stack(rule_prior, dim=0)
+                else:
+                    rule_prior = torch.as_tensor(rule_prior)
+
+            if rule_prior is None:
+                return p_text
+
             # Ensure rule_prior is on same device
             rule_prior = rule_prior.to(p_text.device)
             

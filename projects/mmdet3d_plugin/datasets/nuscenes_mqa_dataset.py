@@ -203,12 +203,18 @@ class NuScenesMQADataset(CustomNuScenesDataset):
             num_object_classes: Number of object classes
             use_camera_prior: Whether to generate camera-based prior masks
         """
-        super().__init__(*args, **kwargs)
+        # Initialize valid_mqa_samples before super().__init__()
+        # because parent class may call __len__ during initialization
+        self.valid_mqa_samples = []
+        self.mqa_annotations = []
+        self.token_to_idx = {}
         
         self.mqa_ann_file = mqa_ann_file
         self.max_count = max_count
         self.num_object_classes = num_object_classes
         self.use_camera_prior = use_camera_prior
+        
+        super().__init__(*args, **kwargs)
         
         # Load MQA annotations
         self.mqa_annotations = self._load_mqa_annotations()
@@ -220,6 +226,12 @@ class NuScenesMQADataset(CustomNuScenesDataset):
         
         # Filter MQA samples that exist in nuScenes data
         self.valid_mqa_samples = self._filter_valid_samples()
+
+        # mmdet's (Distributed)GroupSampler relies on `dataset.flag`.
+        # Some 3D datasets don't set it, or it may be empty after init.
+        # For MQA we don't need grouping, so use a single group for all samples.
+        if not hasattr(self, 'flag') or getattr(self.flag, 'size', 0) != len(self):
+            self.flag = np.zeros(len(self), dtype=np.uint8)
         
         print(f"Loaded {len(self.valid_mqa_samples)} valid MQA samples "
               f"from {len(self.mqa_annotations)} total annotations")
@@ -249,6 +261,21 @@ class NuScenesMQADataset(CustomNuScenesDataset):
     def __len__(self) -> int:
         """Return number of valid MQA samples."""
         return len(self.valid_mqa_samples)
+    
+    def __getitem__(self, idx: int) -> Dict:
+        """Get item by index.
+        
+        Note: idx is an index into valid_mqa_samples, not data_infos.
+        """
+        if self.test_mode:
+            return self.prepare_test_data(idx)
+        
+        while True:
+            data = self.prepare_train_data(idx)
+            if data is not None:
+                return data
+            # If data is None, try next sample
+            idx = (idx + 1) % len(self)
     
     def _parse_mqa_labels(self, mqa_ann: Dict) -> Dict:
         """Parse MQA annotation to extract structured labels.
@@ -363,7 +390,7 @@ class NuScenesMQADataset(CustomNuScenesDataset):
         # Add MQA labels to example
         example['question'] = DC(input_dict['question'], cpu_only=True)
         example['question_type_id'] = DC(
-            torch.tensor(input_dict['question_type_id']), cpu_only=False)
+            torch.tensor(input_dict['question_type_id']), cpu_only=False, stack=True, pad_dims=None)
         
         # Process target objects into tensors
         # Create count tensor: [num_classes] where each entry is the count
@@ -371,13 +398,13 @@ class NuScenesMQADataset(CustomNuScenesDataset):
         for target in input_dict['target_objects']:
             if target['class_id'] >= 0 and target['class_id'] < self.num_object_classes:
                 count_tensor[target['class_id']] = target['count']
-        example['target_counts'] = DC(count_tensor, cpu_only=False)
+        example['target_counts'] = DC(count_tensor, cpu_only=False, stack=True, pad_dims=None)
         
         # Total count for simple counting task
         total_count = sum(t['count'] for t in input_dict['target_objects'])
         example['total_count'] = DC(
             torch.tensor(min(total_count, self.max_count), dtype=torch.long),
-            cpu_only=False)
+            cpu_only=False, stack=True, pad_dims=None)
         
         # Primary object class (first target object)
         if input_dict['target_objects']:
@@ -387,29 +414,29 @@ class NuScenesMQADataset(CustomNuScenesDataset):
             primary_class = -1
             primary_count = 0
         example['primary_object_class'] = DC(
-            torch.tensor(primary_class, dtype=torch.long), cpu_only=False)
+            torch.tensor(primary_class, dtype=torch.long), cpu_only=False, stack=True, pad_dims=None)
         example['primary_object_count'] = DC(
             torch.tensor(min(primary_count, self.max_count), dtype=torch.long),
-            cpu_only=False)
+            cpu_only=False, stack=True, pad_dims=None)
         
         # Location and distance (for regression tasks)
         if input_dict['location'] is not None:
             location = torch.tensor(input_dict['location'], dtype=torch.float32)
         else:
             location = torch.tensor([0.0, 0.0], dtype=torch.float32)
-        example['target_location'] = DC(location, cpu_only=False)
+        example['target_location'] = DC(location, cpu_only=False, stack=True, pad_dims=None)
         example['has_location'] = DC(
             torch.tensor(input_dict['location'] is not None, dtype=torch.bool),
-            cpu_only=False)
+            cpu_only=False, stack=True, pad_dims=None)
         
         if input_dict['distance'] is not None:
             distance = torch.tensor([input_dict['distance']], dtype=torch.float32)
         else:
             distance = torch.tensor([0.0], dtype=torch.float32)
-        example['target_distance'] = DC(distance, cpu_only=False)
+        example['target_distance'] = DC(distance, cpu_only=False, stack=True, pad_dims=None)
         example['has_distance'] = DC(
             torch.tensor(input_dict['distance'] is not None, dtype=torch.bool),
-            cpu_only=False)
+            cpu_only=False, stack=True, pad_dims=None)
         
         # Create prior mask based on camera direction
         if self.use_camera_prior and input_dict['camera_dirs']:
@@ -422,12 +449,12 @@ class NuScenesMQADataset(CustomNuScenesDataset):
                     [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
             )
             example['camera_prior_mask'] = DC(
-                torch.from_numpy(prior_mask), cpu_only=False)
+                torch.from_numpy(prior_mask), cpu_only=False, stack=True, pad_dims=None)
         else:
             example['camera_prior_mask'] = DC(
                 torch.ones(self.bev_size, dtype=torch.float32) / 
                 (self.bev_size[0] * self.bev_size[1]),
-                cpu_only=False)
+                cpu_only=False, stack=True, pad_dims=None)
         
         # Camera direction ID for text encoding
         camera_dir_id = -1
@@ -437,7 +464,7 @@ class NuScenesMQADataset(CustomNuScenesDataset):
             if cam_dir in cam_names:
                 camera_dir_id = cam_names.index(cam_dir)
         example['camera_dir_id'] = DC(
-            torch.tensor(camera_dir_id, dtype=torch.long), cpu_only=False)
+            torch.tensor(camera_dir_id, dtype=torch.long), cpu_only=False, stack=True, pad_dims=None)
         
         return example
     

@@ -15,6 +15,10 @@ _base_ = [
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
+# Language heads are always connected to the loss graph.
+# Keep DDP in the default (more stable) mode.
+find_unused_parameters = False
+
 # Point cloud range (same as bevformer_small)
 point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 voxel_size = [0.2, 0.2, 8]
@@ -42,7 +46,7 @@ _ffn_dim_ = _dim_ * 2
 _num_levels_ = 1
 bev_h_ = 150
 bev_w_ = 150
-queue_length = 1  # Single frame for MQA (no temporal)
+queue_length = 3  # Match bevformer_small temporal setting
 
 # MQA specific settings
 max_count = 20
@@ -51,25 +55,25 @@ num_object_classes = 13  # 10 nuScenes + 3 extended
 model = dict(
     type='BEVFormerMQA',
     use_grid_mask=True,
-    video_test_mode=False,  # No temporal for MQA
+    video_test_mode=True,
     
     # Freeze settings
     # - Backbone: frozen (use FCOS3D pretrained weights)
     # - Neck/BEV Encoder: trainable (learn from scratch)
     # - Text Encoder (BERT): frozen (use pretrained)
     # - Prior Head / MQA Head: trainable
-    freeze_backbone=True,
+    freeze_backbone=False,
     freeze_neck=False,
     freeze_bev_encoder=False,
     freeze_text_encoder=True,
     
-    # Image backbone (ResNet-101 with DCN)
+    # Image backbone (ResNet-101 with DCN - matches bevformer_small)
     img_backbone=dict(
         type='ResNet',
         depth=101,
         num_stages=4,
         out_indices=(3,),
-        frozen_stages=4,  # Freeze all stages
+        frozen_stages=1,
         norm_cfg=dict(type='BN2d', requires_grad=False),
         norm_eval=True,
         style='caffe',
@@ -269,7 +273,18 @@ train_pipeline = [
     dict(type='RandomScaleImageMultiViewImage', scales=[0.8]),
     dict(type='PadMultiViewImage', size_divisor=32),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
-    dict(type='CustomCollect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'img'])
+    dict(
+        type='CustomCollect3D',
+        keys=[
+            'gt_bboxes_3d', 'gt_labels_3d', 'img',
+            # MQA inputs
+            'question', 'question_type_id',
+            'target_counts', 'total_count',
+            'primary_object_class', 'primary_object_count',
+            'target_location', 'has_location',
+            'target_distance', 'has_distance',
+            'camera_prior_mask', 'camera_dir_id',
+        ])
 ]
 
 test_pipeline = [
@@ -287,18 +302,26 @@ test_pipeline = [
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
                 with_label=False),
-            dict(type='CustomCollect3D', keys=['img'])
+            dict(
+                type='CustomCollect3D',
+                keys=[
+                    'img',
+                    # MQA inputs
+                    'question',
+                    'camera_prior_mask',
+                    'camera_dir_id',
+                ])
         ])
 ]
 
 data = dict(
-    samples_per_gpu=4,  # Adjust based on GPU memory
+    samples_per_gpu=2,  # Adjust based on GPU memory
     workers_per_gpu=4,
     train=dict(
         type=dataset_type,
         data_root=data_root,
         mqa_ann_file=mqa_train_ann,
-        ann_file=data_root + 'nuscenes_infos_temporal_train.pkl',
+        ann_file=data_root + 'nuscenes_infos_temporal_train_bg.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -314,7 +337,7 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         mqa_ann_file=mqa_val_ann,
-        ann_file=data_root + 'nuscenes_infos_temporal_val.pkl',
+        ann_file=data_root + 'nuscenes_infos_temporal_val_bg.pkl',
         pipeline=test_pipeline,
         bev_size=(bev_h_, bev_w_),
         classes=class_names,
@@ -326,7 +349,7 @@ data = dict(
         type=dataset_type,
         data_root=data_root,
         mqa_ann_file=mqa_val_ann,
-        ann_file=data_root + 'nuscenes_infos_temporal_val.pkl',
+        ann_file=data_root + 'nuscenes_infos_temporal_val_bg.pkl',
         pipeline=test_pipeline,
         bev_size=(bev_h_, bev_w_),
         classes=class_names,
@@ -340,12 +363,11 @@ data = dict(
 # Optimizer with parameter-wise learning rates (Stage 2 recipe)
 optimizer = dict(
     type='AdamW',
-    lr=1e-4,  # Main learning rate for trainable modules
+    lr=2e-4,
     paramwise_cfg=dict(
         custom_keys={
-            # Backbone and neck should be frozen, but set low LR just in case
-            'img_backbone': dict(lr_mult=0.0),
-            'img_neck': dict(lr_mult=0.0),
+            # Match bevformer_small: finetune backbone with smaller LR
+            'img_backbone': dict(lr_mult=0.1),
             # Text encoder frozen
             'text_encoder.bert': dict(lr_mult=0.0),
             # Prior head - full LR
@@ -367,8 +389,8 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
 
-total_epochs = 12  # MQA typically needs fewer epochs
-evaluation = dict(interval=1, pipeline=test_pipeline)
+total_epochs = 24  # MQA typically needs fewer epochs
+evaluation = dict(interval=23, pipeline=test_pipeline)
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 

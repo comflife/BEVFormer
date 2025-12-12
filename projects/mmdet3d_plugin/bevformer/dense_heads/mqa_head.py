@@ -249,6 +249,12 @@ class MQAHead(BaseModule):
             Dict of losses
         """
         losses = {}
+
+        def _connected_zero(tensor_like: torch.Tensor) -> torch.Tensor:
+            # Return a zero scalar that is still connected to `tensor_like`'s autograd graph.
+            # This avoids per-iteration unused parameters under DDP when a task has no
+            # valid labels in the current batch.
+            return tensor_like.sum() * 0.0
         
         # Count loss (always computed)
         count_logits = preds['count_logits']
@@ -263,25 +269,27 @@ class MQAHead(BaseModule):
             loss_class = self.loss_class(class_logits, gt_cls)
             losses['loss_class'] = loss_class
         else:
-            losses['loss_class'] = torch.tensor(0.0, device=count_logits.device)
+            losses['loss_class'] = _connected_zero(preds['class_logits'])
         
         # Distance loss (for samples with distance labels)
-        if has_distance.any():
-            dist_pred = preds['distance_pred'][has_distance]
-            gt_dist = gt_distances[has_distance]
+        has_distance_mask = has_distance.bool()
+        if has_distance_mask.any():
+            dist_pred = preds['distance_pred'][has_distance_mask]
+            gt_dist = gt_distances[has_distance_mask]
             loss_dist = self.loss_distance(dist_pred, gt_dist)
             losses['loss_distance'] = loss_dist
         else:
-            losses['loss_distance'] = torch.tensor(0.0, device=count_logits.device)
+            losses['loss_distance'] = _connected_zero(preds['distance_pred'])
         
         # Location loss (for samples with location labels)
-        if has_location.any():
-            loc_pred = preds['location_pred'][has_location]
-            gt_loc = gt_locations[has_location]
+        has_location_mask = has_location.bool()
+        if has_location_mask.any():
+            loc_pred = preds['location_pred'][has_location_mask]
+            gt_loc = gt_locations[has_location_mask]
             loss_loc = self.loss_location(loc_pred, gt_loc)
             losses['loss_location'] = loss_loc
         else:
-            losses['loss_location'] = torch.tensor(0.0, device=count_logits.device)
+            losses['loss_location'] = _connected_zero(preds['location_pred'])
         
         return losses
     
