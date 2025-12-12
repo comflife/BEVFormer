@@ -267,7 +267,12 @@ class BEVFormerHead(DETRHead):
         bbox_weights[pos_inds] = 1.0
 
         # DETR
-        bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
+        # NOTE: When there is no positive assignment, `pos_inds` is empty.
+        # In that case, some PyTorch versions can still raise shape-mismatch
+        # errors on empty advanced indexing assignment if the RHS shape does
+        # not exactly match the indexed view. Guarding avoids a hard crash.
+        if pos_inds.numel() > 0:
+            bbox_targets[pos_inds] = sampling_result.pos_gt_bboxes
         return (labels, label_weights, bbox_targets, bbox_weights,
                 pos_inds, neg_inds)
 

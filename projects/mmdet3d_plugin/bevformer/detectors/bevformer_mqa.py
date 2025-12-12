@@ -24,6 +24,7 @@ from projects.mmdet3d_plugin.bevformer.modules.language_prior import (
 )
 import copy
 import numpy as np
+import warnings
 
 
 @DETECTORS.register_module()
@@ -350,6 +351,27 @@ class BEVFormerMQA(MVXTwoStageDetector):
         """
         losses = dict()
 
+        def _connected_zero(tensor_like: torch.Tensor) -> torch.Tensor:
+            return tensor_like.sum() * 0.0
+
+        def _has_valid_3d_gt(gt_bboxes_3d) -> bool:
+            """Return True if gt_bboxes_3d looks like LiDAR 3D boxes with 9-dim tensors.
+
+            BEVFormerHead expects 3D boxes encoded as 9D targets.
+            If the dataset provides 2D boxes (4D) or otherwise mismatched boxes,
+            skip detection loss and use a dummy connected loss instead.
+            """
+            if gt_bboxes_3d is None:
+                return False
+            if not isinstance(gt_bboxes_3d, (list, tuple)) or len(gt_bboxes_3d) == 0:
+                return False
+            first = gt_bboxes_3d[0]
+            if hasattr(first, 'tensor'):
+                return first.tensor.size(-1) == 9
+            if torch.is_tensor(first):
+                return first.size(-1) == 9
+            return False
+
         prev_bev = None
         # Support temporal input (like bevformer_small): img is [B, T, N, C, H, W]
         if img is not None and img.dim() == 6:
@@ -367,11 +389,23 @@ class BEVFormerMQA(MVXTwoStageDetector):
         # Extract image features
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
 
-        # 3D detection branch (same as BEVFormer): compute losses so transformer decoder params are used.
+        # 3D detection branch (optional):
+        # - If valid 3D GT is provided, compute detection losses.
+        # - Otherwise, add a dummy connected loss so DDP sees decoder params as used.
         outs = self.pts_bbox_head(img_feats, img_metas, prev_bev)
-        loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
-        losses_pts = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
-        losses.update(losses_pts)
+        if gt_bboxes_3d is not None and gt_labels_3d is not None and _has_valid_3d_gt(gt_bboxes_3d):
+            loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
+            losses_pts = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
+            losses.update(losses_pts)
+        else:
+            # Connect decoder outputs to the loss graph (no supervision).
+            # This prevents DDP "unused parameters" errors when training only MQA heads.
+            if gt_bboxes_3d is not None and gt_labels_3d is not None and not _has_valid_3d_gt(gt_bboxes_3d):
+                warnings.warn(
+                    'Skipping 3D det loss: gt_bboxes_3d does not look like 9D 3D boxes; '
+                    'using dummy connected loss instead.'
+                )
+            losses['loss_det_dummy'] = _connected_zero(outs['all_cls_scores']) + _connected_zero(outs['all_bbox_preds'])
 
         # BEV features for MQA
         bev_embed = outs['bev_embed']
