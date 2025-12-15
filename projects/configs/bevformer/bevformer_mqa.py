@@ -404,12 +404,12 @@ log_config = dict(
     hooks=[
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
-        # Uncomment for WandB logging
-        # dict(type='WandbLoggerHook',
-        #      init_kwargs=dict(
-        #          project='BEVFormer-MQA',
-        #          name='bevformer_mqa_stage2'
-        #      ))
+        # WandB logging - entity 제거하여 기본 계정 사용
+        dict(type='WandbLoggerHook',
+             init_kwargs=dict(
+                 project='difffp',
+                 name='bevformer_mqa_training'
+             ))
     ])
 
 checkpoint_config = dict(interval=1)
