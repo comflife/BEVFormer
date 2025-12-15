@@ -32,6 +32,7 @@ class TextEncoder(BaseModule):
     def __init__(
         self,
         pretrained_model: str = 'bert-base-uncased',
+        pretrained_weights: str = None,  # Path to custom pretrained weights
         freeze: bool = True,
         output_dim: int = 256,
         pooling: str = 'cls',
@@ -53,6 +54,36 @@ class TextEncoder(BaseModule):
             pretrained_model, 
             use_safetensors=False  # For compatibility with older PyTorch
         )
+        
+        # Load custom pretrained weights if provided
+        if pretrained_weights is not None:
+            import os
+            import torch
+            
+            print(f"Loading custom BERT weights from: {pretrained_weights}")
+            
+            # Check if it's a .pth file or directory
+            if os.path.isfile(pretrained_weights) and pretrained_weights.endswith('.pth'):
+                # Load from full checkpoint
+                checkpoint = torch.load(pretrained_weights, map_location='cpu')
+                if 'model_state_dict' in checkpoint:
+                    # Extract BERT weights from full model checkpoint
+                    bert_state_dict = {}
+                    for key, value in checkpoint['model_state_dict'].items():
+                        if key.startswith('bert.'):
+                            # Remove 'bert.' prefix
+                            new_key = key[5:]
+                            bert_state_dict[new_key] = value
+                    
+                    if bert_state_dict:
+                        self.bert.load_state_dict(bert_state_dict, strict=False)
+                        print("✓ Custom BERT weights loaded successfully from checkpoint")
+                    else:
+                        print("Warning: No BERT weights found in checkpoint, using base BERT")
+                else:
+                    print("Warning: Invalid checkpoint format, using base BERT weights")
+            else:
+                print(f"Warning: {pretrained_weights} not found or invalid, using base BERT weights")
         
         # BERT hidden size is typically 768
         bert_hidden_size = self.bert.config.hidden_size

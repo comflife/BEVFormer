@@ -177,10 +177,11 @@ model = dict(
         loss_bbox=dict(type='L1Loss', loss_weight=0.25),
         loss_iou=dict(type='GIoULoss', loss_weight=0.0)),
     
-    # Text Encoder (BERT-based)
+    # Text Encoder (BERT-based) - Using Contrastively Pretrained BERT
     text_encoder_cfg=dict(
-        pretrained_model='bert-base-uncased',
-        freeze=True,
+        pretrained_model='bert-base-uncased',  # Use for tokenizer and base model
+        pretrained_weights='bert_mqa_pretrain/bert_mqa_pretrain/checkpoints/bert_mqa_epoch3.pth',  # Load custom weights from .pth
+        freeze=False,  # Fine-tuning 활성화 (lr_mult=0.01로 조절)
         output_dim=_dim_,
         pooling='cls',
         max_length=128,
@@ -368,8 +369,8 @@ optimizer = dict(
         custom_keys={
             # Match bevformer_small: finetune backbone with smaller LR
             'img_backbone': dict(lr_mult=0.1),
-            # Text encoder frozen
-            'text_encoder.bert': dict(lr_mult=0.0),
+            # BERT fine-tuning with very small LR (domain adaptation)
+            'text_encoder.bert': dict(lr_mult=0.01),  # 2e-6 - 매우 작은 LR로 fine-tune
             # Prior head - full LR
             'prior_head': dict(lr_mult=1.0),
             # MQA head - full LR
