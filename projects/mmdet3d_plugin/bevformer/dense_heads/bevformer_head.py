@@ -255,10 +255,15 @@ class BEVFormerHead(DETRHead):
         neg_inds = sampling_result.neg_inds
 
         # label targets
+        # Ensure gt_labels dtype is long for CE loss and index-put
+        if gt_labels.dtype != torch.long:
+            gt_labels = gt_labels.to(torch.long)
+
         labels = gt_bboxes.new_full((num_bboxes,),
                                     self.num_classes,
                                     dtype=torch.long)
-        labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
+        if pos_inds.numel() > 0:
+            labels[pos_inds] = gt_labels[sampling_result.pos_assigned_gt_inds]
         label_weights = gt_bboxes.new_ones(num_bboxes)
 
         # bbox targets
