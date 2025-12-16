@@ -88,20 +88,20 @@ class MQAHead(BaseModule):
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
         )
         
         # Count head: predicts count from 0 to max_count
         self.count_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Linear(hidden_dim, max_count + 1),  # 0 to max_count
         )
         
         # Class head: predicts object class
         self.class_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Linear(hidden_dim, num_classes),
         )
         
@@ -111,7 +111,7 @@ class MQAHead(BaseModule):
         for _ in range(num_layers - 1):
             dist_layers.extend([
                 nn.Linear(in_dim, hidden_dim),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
             ])
             in_dim = hidden_dim
         dist_layers.append(nn.Linear(hidden_dim, 1))
@@ -123,7 +123,7 @@ class MQAHead(BaseModule):
         for _ in range(num_layers - 1):
             loc_layers.extend([
                 nn.Linear(in_dim, hidden_dim),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),
             ])
             in_dim = hidden_dim
         loc_layers.append(nn.Linear(hidden_dim, 2))  # (x, y)
@@ -151,24 +151,27 @@ class MQAHead(BaseModule):
         prior: torch.Tensor,
     ) -> torch.Tensor:
         """Pool BEV features weighted by spatial prior.
-        
+
+        Now receives modulated features from PriorGuidedModulation,
+        so the features already contain language-guided information.
+
         Args:
-            bev_feat: [B, C, H, W] BEV feature map
+            bev_feat: [B, C, H, W] BEV feature map (modulated)
             prior: [B, H, W] spatial prior (probabilities)
-            
+
         Returns:
             pooled: [B, C] pooled feature vector
         """
         B, C, H, W = bev_feat.shape
-        
+
         # Normalize prior to sum to 1
-        prior_flat = prior.view(B, H * W)  # [B, H*W]
+        prior_flat = prior.reshape(B, H * W)  # [B, H*W]
         prior_norm = prior_flat / (prior_flat.sum(dim=1, keepdim=True) + 1e-6)
-        prior_norm = prior_norm.view(B, 1, H, W)  # [B, 1, H, W]
-        
-        # Weighted sum
+        prior_norm = prior_norm.reshape(B, 1, H, W)  # [B, 1, H, W]
+
+        # Weighted sum: combine modulated features with spatial attention
         pooled = (bev_feat * prior_norm).sum(dim=[2, 3])  # [B, C]
-        
+
         return pooled
     
     def forward(

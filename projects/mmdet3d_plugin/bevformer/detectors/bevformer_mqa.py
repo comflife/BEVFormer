@@ -20,7 +20,7 @@ from mmdet.models import DETECTORS, build_head
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin.bevformer.modules.language_prior import (
-    TextEncoder, PriorHead, LanguagePriorModule
+    TextEncoder, PriorHead, LanguagePriorModule, PriorGuidedModulation
 )
 import copy
 import numpy as np
@@ -120,30 +120,26 @@ class BEVFormerMQA(MVXTwoStageDetector):
                 pooling='cls',
             )
         self.text_encoder = TextEncoder(**text_encoder_cfg)
-        
+
+        # Build modulation module (combines prior head + feature modulation)
         if prior_head_cfg is None:
             prior_head_cfg = dict(
                 text_dim=256,
+                bev_channels=256,
                 bev_h=150,
                 bev_w=150,
                 hidden_dim=512,
-                num_layers=3,
+                num_prior_layers=3,
                 use_rule_prior=True,
                 rule_prior_weight=0.5,
             )
-        self.prior_head = PriorHead(**prior_head_cfg)
-        
-        if mqa_head_cfg is None:
-            mqa_head_cfg = dict(
-                type='MQAHead',
-                in_channels=256,
-                text_channels=256,
-                max_count=20,
-                num_classes=13,
-                hidden_dim=256,
-                num_layers=2,
-            )
-        self.mqa_head = build_head(mqa_head_cfg)
+        self.modulation = PriorGuidedModulation(**prior_head_cfg)
+
+        # MQA head is optional (not used for detection-only training)
+        if mqa_head_cfg is not None:
+            self.mqa_head = build_head(mqa_head_cfg)
+        else:
+            self.mqa_head = None
         
         # Prior supervision head (optional)
         if prior_supervision_cfg is not None:
@@ -234,7 +230,7 @@ class BEVFormerMQA(MVXTwoStageDetector):
     
     def get_bev_features(self, img_feats, img_metas, prev_bev=None):
         """Get BEV features from image features.
-        
+
         Returns:
             bev_embed: [B, C, H, W] BEV feature map
         """
@@ -251,16 +247,19 @@ class BEVFormerMQA(MVXTwoStageDetector):
         if bev_embed.dim() != 3:
             raise RuntimeError(f'Unexpected bev_embed shape: {tuple(bev_embed.shape)}')
 
-        if bev_embed.shape[0] == hw:
+        # Clone first to break connection to upstream unsqueeze operations
+        bev_embed_clean = bev_embed.clone()
+
+        if bev_embed_clean.shape[0] == hw:
             # [HW, B, C] -> [B, C, HW] -> [B, C, H, W]
-            B = bev_embed.shape[1]
-            C = bev_embed.shape[2]
-            bev_feat = bev_embed.permute(1, 2, 0).contiguous().view(B, C, bev_h, bev_w)
+            B = bev_embed_clean.shape[1]
+            C = bev_embed_clean.shape[2]
+            bev_feat = bev_embed_clean.permute(1, 2, 0).contiguous().reshape(B, C, bev_h, bev_w)
         else:
             # assume [B, HW, C]
-            B = bev_embed.shape[0]
-            C = bev_embed.shape[2]
-            bev_feat = bev_embed.permute(0, 2, 1).contiguous().view(B, C, bev_h, bev_w)
+            B = bev_embed_clean.shape[0]
+            C = bev_embed_clean.shape[2]
+            bev_feat = bev_embed_clean.permute(0, 2, 1).contiguous().reshape(B, C, bev_h, bev_w)
 
         return bev_feat
     
@@ -334,7 +333,7 @@ class BEVFormerMQA(MVXTwoStageDetector):
         **kwargs
     ):
         """Forward training function for MQA.
-        
+
         Args:
             img: [B, N, C, H, W] input images (N is num cameras)
             img_metas: List of image meta info
@@ -389,80 +388,79 @@ class BEVFormerMQA(MVXTwoStageDetector):
         # Extract image features
         img_feats = self.extract_feat(img=img, img_metas=img_metas)
 
-        # 3D detection branch (optional):
-        # - If valid 3D GT is provided, compute detection losses.
-        # - Otherwise, add a dummy connected loss so DDP sees decoder params as used.
-        outs = self.pts_bbox_head(img_feats, img_metas, prev_bev)
-        if gt_bboxes_3d is not None and gt_labels_3d is not None and _has_valid_3d_gt(gt_bboxes_3d):
-            loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
-            losses_pts = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
-            losses.update(losses_pts)
-        else:
-            # Connect decoder outputs to the loss graph (no supervision).
-            # This prevents DDP "unused parameters" errors when training only MQA heads.
-            if gt_bboxes_3d is not None and gt_labels_3d is not None and not _has_valid_3d_gt(gt_bboxes_3d):
-                warnings.warn(
-                    'Skipping 3D det loss: gt_bboxes_3d does not look like 9D 3D boxes; '
-                    'using dummy connected loss instead.'
-                )
-            losses['loss_det_dummy'] = _connected_zero(outs['all_cls_scores']) + _connected_zero(outs['all_bbox_preds'])
+        # Temporarily replace BEVFormer's forward to inject language modulation
+        # 1. Get raw BEV from encoder
+        bev_embed_raw = self.pts_bbox_head(img_feats, img_metas, prev_bev, only_bev=True)
 
-        # BEV features for MQA
-        bev_embed = outs['bev_embed']
         bev_h = self.pts_bbox_head.bev_h
         bev_w = self.pts_bbox_head.bev_w
         hw = bev_h * bev_w
-        if bev_embed.dim() != 3:
-            raise RuntimeError(f'Unexpected outs["bev_embed"] shape: {tuple(bev_embed.shape)}')
 
-        if bev_embed.shape[0] == hw:
+        # 2. Convert BEV to [B, C, H, W] for modulation
+        # Clone first to break connection to upstream unsqueeze operations
+        bev_embed_clean = bev_embed_raw.clone()
+
+        if bev_embed_clean.shape[0] == hw:
             # [HW, B, C]
-            B = bev_embed.shape[1]
-            C = bev_embed.shape[2]
-            bev_feat = bev_embed.permute(1, 2, 0).contiguous().view(B, C, bev_h, bev_w)
+            B = bev_embed_clean.shape[1]
+            C = bev_embed_clean.shape[2]
+            bev_feat = bev_embed_clean.permute(1, 2, 0).contiguous().reshape(B, C, bev_h, bev_w)
         else:
             # [B, HW, C]
-            B = bev_embed.shape[0]
-            C = bev_embed.shape[2]
-            bev_feat = bev_embed.permute(0, 2, 1).contiguous().view(B, C, bev_h, bev_w)
-        
-        # Encode question text
-        # question is a list of strings
+            B = bev_embed_clean.shape[0]
+            C = bev_embed_clean.shape[2]
+            bev_feat = bev_embed_clean.permute(0, 2, 1).contiguous().reshape(B, C, bev_h, bev_w)
+
+        # 3. Encode question text
         if isinstance(question, (list, tuple)):
             questions = question
         else:
             questions = [question]
         text_embedding = self.text_encoder(questions)  # [B, D]
-        
-        # Generate spatial prior
-        prior = self.prior_head(text_embedding, camera_prior_mask)  # [B, H, W]
-        
-        # MQA predictions
-        preds = self.mqa_head(bev_feat, prior, text_embedding)
-        
-        # Compute losses
-        mqa_losses = self.mqa_head.loss(
-            preds=preds,
-            gt_counts=primary_object_count,
-            gt_classes=primary_object_class,
-            gt_distances=target_distance,
-            gt_locations=target_location,
-            has_distance=has_distance,
-            has_location=has_location,
-            question_type_ids=question_type_id,
+
+        # 4. Language-guided BEV feature modulation
+        # This is the core: language modulates BEV to improve detection
+        bev_feat_modulated, prior = self.modulation(
+            bev_feat,
+            text_embedding,
+            camera_prior_mask
+        )  # [B, C, H, W], [B, H, W]
+
+        # 5. Convert modulated BEV to the transformer's expected format: [B, HW, C]
+        bev_modulated_embed = bev_feat_modulated.reshape(B, C, hw).permute(0, 2, 1).contiguous()
+
+        # 6. Run detection with modulated BEV, without recomputing encoder BEV
+        outs = self.pts_bbox_head(
+            img_feats,
+            img_metas,
+            prev_bev=prev_bev,
+            only_bev=False,
+            bev_embed=bev_modulated_embed,
         )
-        
-        # Apply loss weights
-        losses['loss_count'] = mqa_losses['loss_count'] * self.loss_weight_count
-        losses['loss_class'] = mqa_losses['loss_class'] * self.loss_weight_class
-        losses['loss_distance'] = mqa_losses['loss_distance'] * self.loss_weight_distance
-        losses['loss_location'] = mqa_losses['loss_location'] * self.loss_weight_location
-        
-        # Prior supervision loss (if ground truth prior is available)
+
+        # 8. Compute detection loss (MAIN TASK)
+        # Language modules are trained via detection loss backprop
+        if gt_bboxes_3d is not None and gt_labels_3d is not None and _has_valid_3d_gt(gt_bboxes_3d):
+            loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
+            losses_pts = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
+            losses.update(losses_pts)
+        else:
+            # If no valid detection GT, use dummy loss to keep language modules in graph
+            if gt_bboxes_3d is not None and gt_labels_3d is not None and not _has_valid_3d_gt(gt_bboxes_3d):
+                warnings.warn(
+                    'Skipping 3D det loss: gt_bboxes_3d does not look like 9D 3D boxes; '
+                    'using dummy connected loss instead.'
+                )
+            # Connect language modules to graph
+            losses['loss_det_dummy'] = _connected_zero(outs['all_cls_scores']) + _connected_zero(outs['all_bbox_preds'])
+            losses['loss_lang_dummy'] = _connected_zero(bev_feat_modulated) + _connected_zero(prior)
+
+        # 9. Optional: Prior supervision loss to guide language prior
+        # This helps language learn to focus on detection-relevant regions
         if self.prior_supervision_head is not None and camera_prior_mask is not None:
             prior_losses = self.prior_supervision_head.loss(prior, camera_prior_mask)
             losses['loss_prior'] = prior_losses['loss_prior'] * self.loss_weight_prior
-        
+
         return losses
     
     def forward_test(self, img_metas, img=None, **kwargs):
@@ -517,12 +515,16 @@ class BEVFormerMQA(MVXTwoStageDetector):
         else:
             questions = [question]
         text_embedding = self.text_encoder(questions)
-        
-        # Generate prior
-        prior = self.prior_head(text_embedding, camera_prior_mask)
-        
-        # Predictions
-        preds = self.mqa_head(bev_feat, prior, text_embedding)
+
+        # Language-guided BEV feature modulation
+        bev_feat_modulated, prior = self.modulation(
+            bev_feat,
+            text_embedding,
+            camera_prior_mask
+        )
+
+        # Predictions on modulated features
+        preds = self.mqa_head(bev_feat_modulated, prior, text_embedding)
         predictions = self.mqa_head.get_predictions(preds)
         
         # Convert to list of dicts

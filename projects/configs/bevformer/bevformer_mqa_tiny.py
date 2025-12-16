@@ -1,37 +1,13 @@
-# Language-Guided BEVFormer: Improving 3D Detection with Language Prior
-# Based on bevformer_small.py with language-guided feature modulation
+# Language-Guided BEVFormer-MQA (tiny)
 #
-# Key idea:
-# Use language (scene descriptions/questions) to modulate BEV features,
-# improving 3D object detection performance via semantic guidance.
+# This config ports the speed-focused settings from `bevformer_tiny.py` to the
+# language-guided MQA detector (`BEVFormerMQA`).
 #
-# Architecture Flow:
-# Image -> BEVFormer Encoder -> BEV Features (raw) [B, C, H, W]
-#                                      ↓
-# Text -> BERT -> Text Embedding -> PriorGuidedModulation
-#                      ↓                    ↓
-#                 Prior Head         [FiLM + Spatial]
-#                      ↓                    ↓
-#              Spatial Prior -----> BEV Features (modulated) [B, C, H, W]
-#                                           ↓
-#                               BEVFormer Decoder (Detection)
-#                                           ↓
-#                                  3D Detection Outputs
-#                                           ↓
-#                                   Detection Loss (MAIN)
-#                                           ↑
-#                           (backprop trains language modules)
-#
-# Loss:
-# - Detection Loss (cls, bbox, IoU) - MAIN task
-# - Prior Supervision Loss (optional) - helps language focus on relevant regions
-#
-# Training strategy:
-# - Backbone: frozen or low LR (pretrained from FCOS3D)
-# - BEV Encoder: trainable
-# - BERT: fine-tuning with very low LR (pretrained from MQA contrastive)
-# - Modulation: full LR (learned from scratch)
-# - Detection Head: trainable
+# Key tiny changes vs `bevformer_mqa.py`:
+# - Backbone: ResNet-50 (no DCN)
+# - BEV grid: 50x50
+# - Single-scale features (C5)
+# - Smaller image scale (RandomScale 0.5)
 
 _base_ = [
     '../datasets/custom_nus-3d.py',
@@ -42,17 +18,15 @@ plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 
 # Language heads are always connected to the loss graph.
-# Keep DDP in the default (more stable) mode.
 find_unused_parameters = False
 
-# Point cloud range (same as bevformer_small)
 point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 voxel_size = [0.2, 0.2, 8]
 
+# Match `bevformer_tiny.py` normalization (RGB)
 img_norm_cfg = dict(
-    mean=[103.530, 116.280, 123.675], std=[1.0, 1.0, 1.0], to_rgb=False)
+    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
 
-# Object classes (extended for MQA)
 class_names = [
     'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
     'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
@@ -65,48 +39,46 @@ input_modality = dict(
     use_map=False,
     use_external=True)
 
-# Model dimensions
 _dim_ = 256
 _pos_dim_ = _dim_ // 2
 _ffn_dim_ = _dim_ * 2
 _num_levels_ = 1
-bev_h_ = 150
-bev_w_ = 150
-queue_length = 1
 
-# MQA specific settings
+# Tiny BEV
+bev_h_ = 50
+bev_w_ = 50
+
+# Keep as a single frame by default for speed; dataset still supports >1.
+queue_length = 3
+
+# MQA dataset settings
 max_count = 20
-num_object_classes = 13  # 10 nuScenes + 3 extended
+num_object_classes = 13
 
 model = dict(
     type='BEVFormerMQA',
     use_grid_mask=True,
     video_test_mode=True,
-    
-    # Freeze settings
-    # - Backbone: frozen (use FCOS3D pretrained weights)
-    # - Neck/BEV Encoder: trainable (learn from scratch)
-    # - Text Encoder (BERT): frozen (use pretrained)
-    # - Prior Head / MQA Head: trainable
+
+    # Freeze settings (keep trainable like your MQA config)
     freeze_backbone=False,
     freeze_neck=False,
     freeze_bev_encoder=False,
     freeze_text_encoder=True,
-    
-    # Image backbone (ResNet-101 with DCN - matches bevformer_small)
+
+    # Tiny backbone: ResNet-50
     img_backbone=dict(
         type='ResNet',
-        depth=101,
+        depth=50,
         num_stages=4,
         out_indices=(3,),
         frozen_stages=1,
-        norm_cfg=dict(type='BN2d', requires_grad=False),
+        norm_cfg=dict(type='BN', requires_grad=False),
         norm_eval=True,
-        style='caffe',
-        with_cp=True,
-        dcn=dict(type='DCNv2', deform_groups=1, fallback_on_stride=False),
-        stage_with_dcn=(False, False, True, True)),
-    
+        style='pytorch',
+        init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50'),
+    ),
+
     img_neck=dict(
         type='FPN',
         in_channels=[2048],
@@ -114,14 +86,14 @@ model = dict(
         start_level=0,
         add_extra_convs='on_output',
         num_outs=_num_levels_,
-        relu_before_extra_convs=True),
-    
-    # BEVFormer head for BEV feature extraction
+        relu_before_extra_convs=True,
+    ),
+
     pts_bbox_head=dict(
         type='BEVFormerHead',
         bev_h=bev_h_,
         bev_w=bev_w_,
-        num_query=900,
+        num_query=300,
         num_classes=10,
         in_channels=_dim_,
         sync_cls_avg_factor=True,
@@ -145,7 +117,8 @@ model = dict(
                         dict(
                             type='TemporalSelfAttention',
                             embed_dims=_dim_,
-                            num_levels=1),
+                            num_levels=1,
+                        ),
                         dict(
                             type='SpatialCrossAttention',
                             pc_range=point_cloud_range,
@@ -153,14 +126,17 @@ model = dict(
                                 type='MSDeformableAttention3D',
                                 embed_dims=_dim_,
                                 num_points=8,
-                                num_levels=_num_levels_),
+                                num_levels=_num_levels_,
+                            ),
                             embed_dims=_dim_,
-                        )
+                        ),
                     ],
                     feedforward_channels=_ffn_dim_,
                     ffn_dropout=0.1,
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
-                                     'ffn', 'norm'))),
+                                     'ffn', 'norm'),
+                ),
+            ),
             decoder=dict(
                 type='DetectionTransformerDecoder',
                 num_layers=6,
@@ -172,49 +148,57 @@ model = dict(
                             type='MultiheadAttention',
                             embed_dims=_dim_,
                             num_heads=8,
-                            dropout=0.1),
+                            dropout=0.1,
+                        ),
                         dict(
                             type='CustomMSDeformableAttention',
                             embed_dims=_dim_,
-                            num_levels=1),
+                            num_levels=1,
+                        ),
                     ],
                     feedforward_channels=_ffn_dim_,
                     ffn_dropout=0.1,
                     operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
-                                     'ffn', 'norm')))),
+                                     'ffn', 'norm'),
+                ),
+            ),
+        ),
         bbox_coder=dict(
             type='NMSFreeCoder',
             post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
             pc_range=point_cloud_range,
             max_num=300,
             voxel_size=voxel_size,
-            num_classes=10),
+            num_classes=10,
+        ),
         positional_encoding=dict(
             type='LearnedPositionalEncoding',
             num_feats=_pos_dim_,
             row_num_embed=bev_h_,
-            col_num_embed=bev_w_),
+            col_num_embed=bev_w_,
+        ),
         loss_cls=dict(
             type='FocalLoss',
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
-            loss_weight=2.0),
+            loss_weight=2.0,
+        ),
         loss_bbox=dict(type='L1Loss', loss_weight=0.25),
-        loss_iou=dict(type='GIoULoss', loss_weight=0.0)),
-    
-    # Text Encoder (BERT-based) - Using Contrastively Pretrained BERT
+        loss_iou=dict(type='GIoULoss', loss_weight=0.0),
+    ),
+
+    # Text Encoder (BERT-based)
     text_encoder_cfg=dict(
-        pretrained_model='bert-base-uncased',  # Use for tokenizer and base model
-        pretrained_weights='bert_mqa_pretrain/bert_mqa_pretrain/checkpoints/bert_mqa_epoch3.pth',  # Load custom weights from .pth
-        freeze=True,  # Freeze BERT for speed/stability (enables TextEncoder cache)
+        pretrained_model='bert-base-uncased',
+        pretrained_weights='bert_mqa_pretrain/bert_mqa_pretrain/checkpoints/bert_mqa_epoch3.pth',
+        freeze=True,
         output_dim=_dim_,
         pooling='cls',
         max_length=128,
     ),
-    
-    # Prior-Guided Modulation (text -> BEV feature modulation)
-    # This module combines prior generation with feature modulation
+
+    # Prior-guided modulation
     prior_head_cfg=dict(
         text_dim=_dim_,
         bev_channels=_dim_,
@@ -225,26 +209,20 @@ model = dict(
         use_rule_prior=True,
         rule_prior_weight=0.5,
     ),
-    
-    # MQA Head: NOT USED (we only use detection loss)
-    # Kept for compatibility, but loss is not computed
+
+    # MQA head not used (detection loss only)
     mqa_head_cfg=None,
 
-    # Prior Supervision (optional, helps language focus on detection-relevant regions)
-    # This provides weak supervision to guide the language prior
+    # Prior supervision
     prior_supervision_cfg=dict(
         type='PriorSupervisionHead',
         bev_h=bev_h_,
         bev_w=bev_w_,
-        loss_prior=dict(
-            type='BCELoss',
-            loss_weight=0.05),  # Small weight, just for guidance
+        loss_prior=dict(type='BCELoss', loss_weight=0.05),
     ),
 
-    # Loss weights (only prior supervision used, detection loss is main)
-    loss_weight_prior=0.05,  # Small auxiliary loss to guide prior
-    
-    # Training config
+    loss_weight_prior=0.05,
+
     train_cfg=dict(pts=dict(
         grid_size=[512, 512, 1],
         voxel_size=voxel_size,
@@ -255,7 +233,10 @@ model = dict(
             cls_cost=dict(type='FocalLossCost', weight=2.0),
             reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
             iou_cost=dict(type='IoUCost', weight=0.0),
-            pc_range=point_cloud_range))))
+            pc_range=point_cloud_range,
+        ),
+    )),
+)
 
 # Dataset settings
 dataset_type = 'NuScenesMQADataset'
@@ -264,7 +245,7 @@ mqa_train_ann = 'df_train_mqa.csv'
 mqa_val_ann = 'df_val_mqa.csv'
 file_client_args = dict(backend='disk')
 
-# Training pipeline (simplified for MQA - single frame)
+# Pipelines (match tiny scaling)
 train_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
     dict(type='PhotoMetricDistortionMultiViewImage'),
@@ -272,21 +253,21 @@ train_pipeline = [
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilter', classes=class_names),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='RandomScaleImageMultiViewImage', scales=[0.8]),
+    dict(type='RandomScaleImageMultiViewImage', scales=[0.5]),
     dict(type='PadMultiViewImage', size_divisor=32),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
     dict(
         type='CustomCollect3D',
         keys=[
             'gt_bboxes_3d', 'gt_labels_3d', 'img',
-            # MQA inputs
             'question', 'question_type_id',
             'target_counts', 'total_count',
             'primary_object_class', 'primary_object_count',
             'target_location', 'has_location',
             'target_distance', 'has_distance',
             'camera_prior_mask', 'camera_dir_id',
-        ])
+        ],
+    ),
 ]
 
 test_pipeline = [
@@ -298,27 +279,17 @@ test_pipeline = [
         pts_scale_ratio=1,
         flip=False,
         transforms=[
-            dict(type='RandomScaleImageMultiViewImage', scales=[0.8]),
+            dict(type='RandomScaleImageMultiViewImage', scales=[0.5]),
             dict(type='PadMultiViewImage', size_divisor=32),
-            dict(
-                type='DefaultFormatBundle3D',
-                class_names=class_names,
-                with_label=False),
-            dict(
-                type='CustomCollect3D',
-                keys=[
-                    'img',
-                    # MQA inputs
-                    'question',
-                    'camera_prior_mask',
-                    'camera_dir_id',
-                ])
-        ])
+            dict(type='DefaultFormatBundle3D', class_names=class_names, with_label=False),
+            dict(type='CustomCollect3D', keys=['img', 'question', 'camera_prior_mask', 'camera_dir_id']),
+        ],
+    ),
 ]
 
 data = dict(
-    samples_per_gpu=2,  # Adjust based on GPU memory
-    workers_per_gpu=4,
+    samples_per_gpu=2,
+    workers_per_gpu=8,
     train=dict(
         type=dataset_type,
         data_root=data_root,
@@ -334,7 +305,8 @@ data = dict(
         max_count=max_count,
         num_object_classes=num_object_classes,
         use_camera_prior=True,
-        box_type_3d='LiDAR'),
+        box_type_3d='LiDAR',
+    ),
     val=dict(
         type=dataset_type,
         data_root=data_root,
@@ -346,7 +318,8 @@ data = dict(
         modality=input_modality,
         max_count=max_count,
         num_object_classes=num_object_classes,
-        samples_per_gpu=1),
+        samples_per_gpu=1,
+    ),
     test=dict(
         type=dataset_type,
         data_root=data_root,
@@ -357,61 +330,53 @@ data = dict(
         classes=class_names,
         modality=input_modality,
         max_count=max_count,
-        num_object_classes=num_object_classes),
+        num_object_classes=num_object_classes,
+    ),
     shuffler_sampler=dict(type='DistributedGroupSampler'),
-    nonshuffler_sampler=dict(type='DistributedSampler')
+    nonshuffler_sampler=dict(type='DistributedSampler'),
 )
 
-# Optimizer with parameter-wise learning rates (Stage 2 recipe)
 optimizer = dict(
     type='AdamW',
     lr=2e-4,
     paramwise_cfg=dict(
         custom_keys={
-            # Match bevformer_small: finetune backbone with smaller LR
             'img_backbone': dict(lr_mult=0.1),
-            # BERT fine-tuning with very small LR (domain adaptation)
-            'text_encoder.bert': dict(lr_mult=0.01),  # 2e-6 - 매우 작은 LR로 fine-tune
-            # Prior head - full LR
-            'prior_head': dict(lr_mult=1.0),
-            # MQA head - full LR
-            'mqa_head': dict(lr_mult=1.0),
-            # Text encoder projection - slightly lower LR
+            # BERT is frozen; keep key for clarity
+            'text_encoder.bert': dict(lr_mult=0.0),
             'text_encoder.projection': dict(lr_mult=0.5),
-        }),
-    weight_decay=0.01)
+            'prior_head': dict(lr_mult=1.0),
+        }
+    ),
+    weight_decay=0.01,
+)
 
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
 
-# Learning rate schedule
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
-    min_lr_ratio=1e-3)
+    min_lr_ratio=1e-3,
+)
 
-total_epochs = 24  # MQA typically needs fewer epochs
+total_epochs = 24
 evaluation = dict(interval=23, pipeline=test_pipeline)
-
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
 
-# Load pretrained BEVFormer weights
 load_from = 'ckpts/r101_dcn_fcos3d_pretrain.pth'
-# Or load from trained BEVFormer checkpoint:
-# load_from = 'work_dirs/bevformer_small/latest.pth'
 
 log_config = dict(
     interval=50,
     hooks=[
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook'),
-        # WandB logging - entity 제거하여 기본 계정 사용
-        dict(type='WandbLoggerHook',
-             init_kwargs=dict(
-                 project='difffp',
-                 name='bevformer_mqa_training'
-             ))
-    ])
+        dict(
+            type='WandbLoggerHook',
+            init_kwargs=dict(project='difffp', name='bevformer_mqa_tiny_training'),
+        ),
+    ],
+)
 
 checkpoint_config = dict(interval=1)
