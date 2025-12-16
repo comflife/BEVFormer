@@ -144,16 +144,26 @@ class PerceptionTransformer(BaseModule):
             if prev_bev.shape[1] == bev_h * bev_w:
                 prev_bev = prev_bev.permute(1, 0, 2)
             if self.rotate_prev_bev:
+                # Do NOT modify prev_bev in-place.
+                # The rotate() path uses views of prev_bev; writing back into prev_bev
+                # would mutate the underlying storage and can break autograd versioning.
+                rotated_prev_bev = prev_bev
                 for i in range(bs):
                     # num_prev_bev = prev_bev.size(1)
                     rotation_angle = kwargs['img_metas'][i]['can_bus'][-1]
+                    # Make a contiguous tensor that does not share storage with prev_bev
                     tmp_prev_bev = prev_bev[:, i].reshape(
-                        bev_h, bev_w, -1).permute(2, 0, 1)
+                        bev_h, bev_w, -1).permute(2, 0, 1).contiguous()
                     tmp_prev_bev = rotate(tmp_prev_bev, rotation_angle,
                                           center=self.rotate_center)
                     tmp_prev_bev = tmp_prev_bev.permute(1, 2, 0).reshape(
                         bev_h * bev_w, 1, -1)
-                    prev_bev[:, i] = tmp_prev_bev[:, 0]
+                    # Write into a cloned tensor to avoid in-place modification on graph inputs
+                    if rotated_prev_bev is prev_bev:
+                        rotated_prev_bev = prev_bev.clone()
+                    rotated_prev_bev[:, i] = tmp_prev_bev[:, 0]
+
+                prev_bev = rotated_prev_bev
 
         # add can bus signals
         can_bus = bev_queries.new_tensor(
@@ -199,7 +209,7 @@ class PerceptionTransformer(BaseModule):
 
         return bev_embed
 
-    @auto_fp16(apply_to=('mlvl_feats', 'bev_queries', 'object_query_embed', 'prev_bev', 'bev_pos'))
+    @auto_fp16(apply_to=('mlvl_feats', 'bev_queries', 'object_query_embed', 'prev_bev', 'bev_pos', 'bev_embed'))
     def forward(self,
                 mlvl_feats,
                 bev_queries,
@@ -211,6 +221,7 @@ class PerceptionTransformer(BaseModule):
                 reg_branches=None,
                 cls_branches=None,
                 prev_bev=None,
+                bev_embed=None,
                 **kwargs):
         """Forward function for `Detr3DTransformer`.
         Args:
@@ -248,18 +259,36 @@ class PerceptionTransformer(BaseModule):
                     be returned when `as_two_stage` is True, \
                     otherwise None.
         """
-
-        bev_embed = self.get_bev_features(
-            mlvl_feats,
-            bev_queries,
-            bev_h,
-            bev_w,
-            grid_length=grid_length,
-            bev_pos=bev_pos,
-            prev_bev=prev_bev,
-            **kwargs)  # bev_embed shape: bs, bev_h*bev_w, embed_dims
-
         bs = mlvl_feats[0].size(0)
+
+        # Allow callers to provide a precomputed BEV embedding to avoid running
+        # the BEV encoder twice (e.g., language-guided BEV modulation).
+        # Expected shape: [bs, bev_h*bev_w, embed_dims]. For compatibility,
+        # also accept [bev_h*bev_w, bs, embed_dims].
+        if bev_embed is None:
+            bev_embed = self.get_bev_features(
+                mlvl_feats,
+                bev_queries,
+                bev_h,
+                bev_w,
+                grid_length=grid_length,
+                bev_pos=bev_pos,
+                prev_bev=prev_bev,
+                **kwargs)  # bev_embed shape: bs, bev_h*bev_w, embed_dims
+        else:
+            hw = bev_h * bev_w
+            if bev_embed.dim() != 3:
+                raise RuntimeError(f'Unexpected bev_embed shape: {tuple(bev_embed.shape)}')
+            if bev_embed.shape[0] == hw and bev_embed.shape[1] == bs:
+                # [HW, bs, C] -> [bs, HW, C]
+                bev_embed = bev_embed.permute(1, 0, 2).contiguous()
+            elif bev_embed.shape[0] == bs and bev_embed.shape[1] == hw:
+                # [bs, HW, C]
+                pass
+            else:
+                raise RuntimeError(
+                    f'bev_embed must be [bs, HW, C] or [HW, bs, C]; got {tuple(bev_embed.shape)}, '
+                    f'expected bs={bs}, HW={hw}')
         query_pos, query = torch.split(
             object_query_embed, self.embed_dims, dim=1)
         query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from mmcv.runner import BaseModule
 from mmdet.models import HEADS
 import math
+from collections import OrderedDict
 
 
 class TextEncoder(BaseModule):
@@ -37,6 +38,8 @@ class TextEncoder(BaseModule):
         output_dim: int = 256,
         pooling: str = 'cls',
         max_length: int = 128,
+        enable_cache: bool = True,
+        cache_size: int = 10000,
     ):
         super().__init__()
         
@@ -45,6 +48,13 @@ class TextEncoder(BaseModule):
         self.output_dim = output_dim
         self.pooling = pooling
         self.max_length = max_length
+        self.enable_cache = enable_cache
+        self.cache_size = cache_size
+
+        # Cache for repeated questions.
+        # We cache the pooled BERT output (pre-projection) on CPU when BERT is frozen,
+        # so projection stays trainable and gradients still flow through projection.
+        self._pooled_cache = OrderedDict()  # str -> torch.Tensor([bert_hidden]) on CPU
         
         # Load BERT model and tokenizer
         from transformers import BertModel, BertTokenizer
@@ -92,7 +102,7 @@ class TextEncoder(BaseModule):
         self.projection = nn.Sequential(
             nn.Linear(bert_hidden_size, output_dim),
             nn.LayerNorm(output_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
         )
         
         # Freeze BERT if specified
@@ -111,41 +121,97 @@ class TextEncoder(BaseModule):
         """
         device = next(self.projection.parameters()).device
         
-        # Tokenize questions
-        inputs = self.tokenizer(
-            questions,
-            return_tensors='pt',
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-        )
-        
-        # Move to device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        
-        # Get BERT outputs
-        with torch.set_grad_enabled(not self.freeze):
-            outputs = self.bert(**inputs)
-        
-        # Pool the outputs
-        if self.pooling == 'cls':
-            # Use [CLS] token embedding
-            pooled = outputs.pooler_output
-        elif self.pooling == 'mean':
-            # Mean pooling over all tokens
-            attention_mask = inputs['attention_mask'].unsqueeze(-1)
-            pooled = (outputs.last_hidden_state * attention_mask).sum(1)
-            pooled = pooled / attention_mask.sum(1)
-        elif self.pooling == 'max':
-            # Max pooling over all tokens
-            pooled = outputs.last_hidden_state.max(dim=1)[0]
-        else:
-            raise ValueError(f"Unknown pooling strategy: {self.pooling}")
-        
-        # Project to output dimension
-        text_embedding = self.projection(pooled)
-        
-        return text_embedding
+        # If BERT is frozen, we can safely cache the pooled (pre-projection) output.
+        # If BERT is trainable (freeze=False), NEVER detach pooled outputs, otherwise
+        # BERT parameters will not receive gradients and DDP will error on unused params.
+        use_cache = bool(self.enable_cache and self.freeze and self.cache_size and self.cache_size > 0)
+
+        if not use_cache:
+            inputs = self.tokenizer(
+                questions,
+                return_tensors='pt',
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            with torch.set_grad_enabled(not self.freeze):
+                outputs = self.bert(**inputs)
+
+            if self.pooling == 'cls':
+                pooled = outputs.pooler_output
+            elif self.pooling == 'mean':
+                attention_mask = inputs['attention_mask'].unsqueeze(-1)
+                pooled = (outputs.last_hidden_state * attention_mask).sum(1)
+                pooled = pooled / attention_mask.sum(1)
+            elif self.pooling == 'max':
+                pooled = outputs.last_hidden_state.max(dim=1)[0]
+            else:
+                raise ValueError(f"Unknown pooling strategy: {self.pooling}")
+
+            proj_dtype = self.projection[0].weight.dtype
+            pooled = pooled.to(dtype=proj_dtype)
+            return self.projection(pooled)
+
+        pooled_cpu_list = [None] * len(questions)
+        missing_questions = []
+        missing_indices = []
+
+        for idx, q in enumerate(questions):
+            cached = self._pooled_cache.get(q)
+            if cached is not None:
+                # LRU: refresh
+                self._pooled_cache.move_to_end(q)
+                pooled_cpu_list[idx] = cached
+            else:
+                missing_questions.append(q)
+                missing_indices.append(idx)
+
+        if len(missing_questions) > 0:
+            # Tokenize only missing questions
+            inputs = self.tokenizer(
+                missing_questions,
+                return_tensors='pt',
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            # Get BERT outputs (frozen)
+            with torch.set_grad_enabled(not self.freeze):
+                outputs = self.bert(**inputs)
+
+            # Pool the outputs
+            if self.pooling == 'cls':
+                pooled = outputs.pooler_output
+            elif self.pooling == 'mean':
+                attention_mask = inputs['attention_mask'].unsqueeze(-1)
+                pooled = (outputs.last_hidden_state * attention_mask).sum(1)
+                pooled = pooled / attention_mask.sum(1)
+            elif self.pooling == 'max':
+                pooled = outputs.last_hidden_state.max(dim=1)[0]
+            else:
+                raise ValueError(f"Unknown pooling strategy: {self.pooling}")
+
+            # Move pooled to CPU for caching, one item per question.
+            pooled_cpu = pooled.detach().to('cpu')
+
+            for j, idx in enumerate(missing_indices):
+                pooled_cpu_list[idx] = pooled_cpu[j]
+                q = questions[idx]
+                self._pooled_cache[q] = pooled_cpu[j]
+                self._pooled_cache.move_to_end(q)
+                # Evict LRU
+                while len(self._pooled_cache) > self.cache_size:
+                    self._pooled_cache.popitem(last=False)
+
+        # Stack pooled outputs in original order and move to device for projection
+        pooled = torch.stack(pooled_cpu_list, dim=0)
+        proj_dtype = self.projection[0].weight.dtype
+        pooled = pooled.to(device=device, dtype=proj_dtype)
+        return self.projection(pooled)
 
 
 @HEADS.register_module()
@@ -198,7 +264,7 @@ class PriorHead(BaseModule):
             layers.extend([
                 nn.Linear(in_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
-                nn.ReLU(inplace=True),
+                nn.ReLU(inplace=False),  # Changed to avoid gradient issues
             ])
             in_dim = hidden_dim
         
@@ -249,17 +315,26 @@ class PriorHead(BaseModule):
             prior: [B, H, W] spatial prior probability map (after sigmoid)
         """
         B = text_embedding.shape[0]
-        
+
         # Generate text-based prior
         x = self.mlp(text_embedding)  # [B, low_res_h * low_res_w]
-        x = x.view(B, 1, self.low_res_h, self.low_res_w)
+        x = x.reshape(B, 1, self.low_res_h, self.low_res_w)
         x = self.upsample(x)  # [B, 1, bev_h, bev_w]
-        x = x.squeeze(1)  # [B, bev_h, bev_w]
+
+        # Apply sigmoid, squeeze, and clone to create independent tensor
+        # This avoids inplace modification errors during backward pass
+        p_text = torch.sigmoid(x).squeeze(1).clone()  # [B, bev_h, bev_w]
         
-        # Apply sigmoid to get probabilities
-        p_text = torch.sigmoid(x)
-        
-        # Combine with rule prior if available
+        # Combine with rule prior if available.
+        # IMPORTANT (DDP): `rule_prior_weight` is a learnable Parameter created when
+        # `use_rule_prior=True`. Some batches/ranks may not provide `rule_prior`.
+        # If we return `p_text` without touching `rule_prior_weight`, DDP can throw
+        # "Expected to have finished reduction..." due to unused parameters.
+        # We keep `rule_prior_weight` in the autograd graph even when `rule_prior`
+        # is missing by adding a connected zero term.
+        if self.use_rule_prior:
+            alpha = torch.sigmoid(self.rule_prior_weight)
+
         if self.use_rule_prior and rule_prior is not None:
             # Dataloader may provide rule_prior as a list (when not stacked).
             # Normalize to a tensor of shape [B, H, W].
@@ -272,18 +347,21 @@ class PriorHead(BaseModule):
                     rule_prior = torch.as_tensor(rule_prior)
 
             if rule_prior is None:
-                return p_text
+                # Keep `rule_prior_weight` connected for DDP.
+                return p_text + (alpha * 0.0)
 
             # Ensure rule_prior is on same device
             rule_prior = rule_prior.to(p_text.device)
             
-            # Clamp weight to [0, 1]
-            alpha = torch.sigmoid(self.rule_prior_weight)
-            
             # Mix priors: P = α * P_rule + (1-α) * P_text
-            prior = alpha * rule_prior + (1 - alpha) * p_text
+            # Clone the result to ensure it's an independent tensor
+            prior = (alpha * rule_prior + (1 - alpha) * p_text).clone()
         else:
-            prior = p_text
+            # If rule prior isn't provided, still keep `rule_prior_weight` connected.
+            if self.use_rule_prior:
+                prior = p_text + (alpha * 0.0)
+            else:
+                prior = p_text
         
         return prior
 
@@ -385,20 +463,159 @@ class PriorInjection(BaseModule):
         return weights
 
 
+@HEADS.register_module()
+class PriorGuidedModulation(BaseModule):
+    """Prior-Guided BEV Feature Modulation Module.
+
+    This module uses language prior to modulate BEV features through:
+    1. Channel-wise modulation (FiLM) based on text embedding
+    2. Spatial modulation using prior map as additional channel
+    3. Residual connection to preserve original BEV information
+
+    Args:
+        text_dim: Text embedding dimension
+        bev_channels: BEV feature channels
+        bev_h, bev_w: BEV grid dimensions
+        hidden_dim: Hidden dimension for prior head
+        num_prior_layers: Number of layers in prior head
+        use_rule_prior: Whether to use rule-based camera prior
+        rule_prior_weight: Initial weight for rule prior mixing
+    """
+
+    def __init__(
+        self,
+        text_dim: int = 256,
+        bev_channels: int = 256,
+        bev_h: int = 150,
+        bev_w: int = 150,
+        hidden_dim: int = 512,
+        num_prior_layers: int = 3,
+        use_rule_prior: bool = True,
+        rule_prior_weight: float = 0.5,
+        init_cfg: dict = None,
+    ):
+        super().__init__(init_cfg)
+
+        self.text_dim = text_dim
+        self.bev_channels = bev_channels
+        self.bev_h = bev_h
+        self.bev_w = bev_w
+
+        # Prior head for generating spatial prior
+        self.prior_head = PriorHead(
+            text_dim=text_dim,
+            bev_h=bev_h,
+            bev_w=bev_w,
+            hidden_dim=hidden_dim,
+            num_layers=num_prior_layers,
+            use_rule_prior=use_rule_prior,
+            rule_prior_weight=rule_prior_weight,
+        )
+
+        # Channel-wise modulation (FiLM)
+        self.gamma_fc = nn.Linear(text_dim, bev_channels)
+        self.beta_fc = nn.Linear(text_dim, bev_channels)
+
+        # Spatial refinement: concat prior as extra channel
+        self.spatial_refine = nn.Sequential(
+            nn.Conv2d(bev_channels + 1, bev_channels, 3, padding=1),
+            nn.BatchNorm2d(bev_channels),
+            nn.ReLU(inplace=False),  # Changed from inplace=True to avoid gradient issues
+            nn.Conv2d(bev_channels, bev_channels, 3, padding=1),
+            nn.BatchNorm2d(bev_channels),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights for stable training.
+
+        Strategy: Start from identity (language has no effect initially)
+        - gamma = 1.0 (preserve original features)
+        - beta = 0.0 (no shift)
+        - spatial refinement ≈ 0 (via residual connection)
+        """
+        # Initialize FiLM parameters to output constant values
+        # gamma_fc should output 1.0 for any input
+        nn.init.zeros_(self.gamma_fc.weight)
+        nn.init.ones_(self.gamma_fc.bias)   # gamma = 0*text + 1 = 1.0
+
+        # beta_fc should output 0.0 for any input
+        nn.init.zeros_(self.beta_fc.weight)
+        nn.init.zeros_(self.beta_fc.bias)   # beta = 0*text + 0 = 0.0
+
+        # Initialize spatial refinement to near-zero output
+        # This makes the residual connection start from identity
+        for m in self.spatial_refine.modules():
+            if isinstance(m, nn.Conv2d):
+                # Small random initialization (not kaiming)
+                nn.init.normal_(m.weight, mean=0.0, std=0.001)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        bev_feat: torch.Tensor,
+        text_embedding: torch.Tensor,
+        camera_prior: torch.Tensor = None,
+    ) -> tuple:
+        """Forward pass for BEV feature modulation.
+
+        Args:
+            bev_feat: [B, C, H, W] raw BEV features from BEVFormer
+            text_embedding: [B, D] text embedding from BERT
+            camera_prior: [B, H, W] optional rule-based camera prior
+
+        Returns:
+            tuple of:
+                - modulated_feat: [B, C, H, W] modulated BEV features
+                - prior: [B, H, W] spatial prior map
+        """
+        B, C, H, W = bev_feat.shape
+
+        # 1. Generate spatial prior from text
+        prior = self.prior_head(text_embedding, camera_prior)  # [B, H, W]
+
+        # 2. Channel-wise modulation (FiLM)
+        gamma = self.gamma_fc(text_embedding).reshape(B, C, 1, 1)  # [B, C, 1, 1]
+        beta = self.beta_fc(text_embedding).reshape(B, C, 1, 1)    # [B, C, 1, 1]
+
+        # Apply FiLM: modulate each channel
+        # Use clone() to create a completely independent tensor
+        feat_modulated = (gamma * bev_feat + beta).clone()  # [B, C, H, W]
+
+        # 3. Spatial modulation: concatenate prior as additional channel
+        # Clone prior to create a completely new tensor that doesn't share storage
+        # This avoids the inplace modification error during backward (UnsqueezeBackward0)
+        prior_for_concat = prior.clone().unsqueeze(1)  # [B, 1, H, W]
+        feat_with_prior = torch.cat([feat_modulated, prior_for_concat], dim=1)  # [B, C+1, H, W]
+
+        # Apply spatial refinement
+        feat_refined = self.spatial_refine(feat_with_prior)  # [B, C, H, W]
+
+        # 4. Residual connection to preserve original information
+        modulated_feat = feat_refined + bev_feat  # [B, C, H, W]
+
+        return modulated_feat, prior
+
+
 class LanguagePriorModule(BaseModule):
     """Complete Language Prior Module combining all components.
-    
+
     This module:
     1. Encodes question text to embedding
     2. Generates spatial prior from text
     3. Provides interface for attention injection
-    
+
     Args:
         text_encoder_cfg: Config for TextEncoder
         prior_head_cfg: Config for PriorHead
         prior_injection_cfg: Config for PriorInjection
     """
-    
+
     def __init__(
         self,
         text_encoder_cfg: dict = None,
@@ -406,7 +623,7 @@ class LanguagePriorModule(BaseModule):
         prior_injection_cfg: dict = None,
     ):
         super().__init__()
-        
+
         # Default configs
         if text_encoder_cfg is None:
             text_encoder_cfg = {}
@@ -414,23 +631,23 @@ class LanguagePriorModule(BaseModule):
             prior_head_cfg = {}
         if prior_injection_cfg is None:
             prior_injection_cfg = {}
-        
+
         # Build modules
         self.text_encoder = TextEncoder(**text_encoder_cfg)
         self.prior_head = PriorHead(**prior_head_cfg)
         self.prior_injection = PriorInjection(**prior_injection_cfg)
-    
+
     def forward(
         self,
         questions: list,
         rule_prior: torch.Tensor = None,
     ) -> dict:
         """Forward pass.
-        
+
         Args:
             questions: List of question strings
             rule_prior: Optional rule-based prior [B, H, W]
-            
+
         Returns:
             dict containing:
                 - text_embedding: [B, D] text embedding
@@ -438,15 +655,15 @@ class LanguagePriorModule(BaseModule):
         """
         # Encode text
         text_embedding = self.text_encoder(questions)
-        
+
         # Generate prior
         prior = self.prior_head(text_embedding, rule_prior)
-        
+
         return {
             'text_embedding': text_embedding,
             'prior': prior,
         }
-    
+
     def get_attention_bias(
         self,
         prior: torch.Tensor,

@@ -115,7 +115,7 @@ class BEVFormerHead(DETRHead):
                 nn.init.constant_(m[-1].bias, bias_init)
 
     @auto_fp16(apply_to=('mlvl_feats'))
-    def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False):
+    def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False, bev_embed=None):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -165,7 +165,8 @@ class BEVFormerHead(DETRHead):
                 reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
                 cls_branches=self.cls_branches if self.as_two_stage else None,
                 img_metas=img_metas,
-                prev_bev=prev_bev
+                prev_bev=prev_bev,
+                bev_embed=bev_embed,
         )
 
         bev_embed, hs, init_reference, inter_references = outputs
@@ -393,10 +394,18 @@ class BEVFormerHead(DETRHead):
         isnotnan = torch.isfinite(normalized_bbox_targets).all(dim=-1)
         bbox_weights = bbox_weights * self.code_weights
 
-        loss_bbox = self.loss_bbox(
-            bbox_preds[isnotnan, :10], normalized_bbox_targets[isnotnan,
-                                                               :10], bbox_weights[isnotnan, :10],
-            avg_factor=num_total_pos)
+        # It is possible (especially early in training or with unusual GT) that
+        # all targets contain NaNs/Infs after normalization. In that case the
+        # selected tensors are empty and some loss implementations (e.g. SmoothL1)
+        # assert on target.numel() > 0. Return a connected zero loss instead.
+        if isnotnan.sum() == 0:
+            loss_bbox = bbox_preds.sum() * 0.0
+        else:
+            loss_bbox = self.loss_bbox(
+                bbox_preds[isnotnan, :10],
+                normalized_bbox_targets[isnotnan, :10],
+                bbox_weights[isnotnan, :10],
+                avg_factor=num_total_pos)
         if digit_version(TORCH_VERSION) >= digit_version('1.8'):
             loss_cls = torch.nan_to_num(loss_cls)
             loss_bbox = torch.nan_to_num(loss_bbox)

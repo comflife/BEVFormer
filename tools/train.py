@@ -84,6 +84,10 @@ def parse_args():
         '--autoscale-lr',
         action='store_true',
         help='automatically scale lr with the number of gpus')
+    parser.add_argument(
+        '--detect-anomaly',
+        action='store_true',
+        help='enable torch autograd anomaly detection (slow, for debugging inplace/backward errors)')
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -101,6 +105,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Debugging aid: prints forward op that caused backward failure.
+    if getattr(args, 'detect_anomaly', False):
+        torch.autograd.set_detect_anomaly(True)
 
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
