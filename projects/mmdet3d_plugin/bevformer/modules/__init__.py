@@ -6,4 +6,5 @@ from .encoder import BEVFormerEncoder, BEVFormerLayer
 from .decoder import DetectionTransformerDecoder
 from .group_attention import GroupMultiheadAttention
 from .language_prior import TextEncoder, PriorHead, PriorInjection, LanguagePriorModule
+from .clip_text_encoder import CLIPTextEncoder
 

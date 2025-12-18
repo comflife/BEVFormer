@@ -115,14 +115,16 @@ class BEVFormerHead(DETRHead):
                 nn.init.constant_(m[-1].bias, bias_init)
 
     @auto_fp16(apply_to=('mlvl_feats'))
-    def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False, bev_embed=None):
+    def forward(self, mlvl_feats, img_metas, prev_bev=None,  only_bev=False, bev_embed=None, object_query_embeds=None):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
                 network, each is a 5D-tensor with shape
                 (B, N, C, H, W).
             prev_bev: previous bev featues
-            only_bev: only compute BEV features with encoder. 
+            only_bev: only compute BEV features with encoder.
+            bev_embed: optional pre-computed BEV features
+            object_query_embeds: optional pre-computed object query embeddings [B, N_q, D]
         Returns:
             all_cls_scores (Tensor): Outputs from the classification head, \
                 shape [nb_dec, bs, num_query, cls_out_channels]. Note \
@@ -133,7 +135,14 @@ class BEVFormerHead(DETRHead):
         """
         bs, num_cam, _, _, _ = mlvl_feats[0].shape
         dtype = mlvl_feats[0].dtype
-        object_query_embeds = self.query_embedding.weight.to(dtype)
+
+        # Use provided object_query_embeds or default ones
+        if object_query_embeds is None:
+            object_query_embeds = self.query_embedding.weight.to(dtype)
+        else:
+            # object_query_embeds is [B, N_q, D], need to extract for transformer
+            # Transformer expects [N_q, D], so we'll handle batching in transformer
+            pass  # Will be handled below
         bev_queries = self.bev_embedding.weight.to(dtype)
 
         bev_mask = torch.zeros((bs, self.bev_h, self.bev_w),

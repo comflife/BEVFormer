@@ -22,6 +22,8 @@ from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin.bevformer.modules.language_prior import (
     TextEncoder, PriorHead, LanguagePriorModule, PriorGuidedModulation
 )
+from projects.mmdet3d_plugin.bevformer.modules.clip_text_encoder import CLIPTextEncoder
+from projects.mmdet3d_plugin.bevformer.modules.query_modulator import QueryModulator, SparseQueryModulator
 import copy
 import numpy as np
 import warnings
@@ -77,6 +79,9 @@ class BEVFormerMQA(MVXTwoStageDetector):
         mqa_head_cfg=None,
         prior_supervision_cfg=None,
         use_prior_injection=True,
+        # Language modulation strategy
+        modulation_type='dense_bev',  # 'dense_bev' or 'query_level'
+        query_modulator_cfg=None,
         # Loss weights
         loss_weight_count=1.0,
         loss_weight_class=1.0,
@@ -103,7 +108,8 @@ class BEVFormerMQA(MVXTwoStageDetector):
         self.freeze_bev_encoder = freeze_bev_encoder
         self.freeze_text_encoder = freeze_text_encoder
         self.use_prior_injection = use_prior_injection
-        
+        self.modulation_type = modulation_type
+
         # Loss weights
         self.loss_weight_count = loss_weight_count
         self.loss_weight_class = loss_weight_class
@@ -119,21 +125,49 @@ class BEVFormerMQA(MVXTwoStageDetector):
                 output_dim=256,
                 pooling='cls',
             )
-        self.text_encoder = TextEncoder(**text_encoder_cfg)
 
-        # Build modulation module (combines prior head + feature modulation)
-        if prior_head_cfg is None:
-            prior_head_cfg = dict(
-                text_dim=256,
-                bev_channels=256,
-                bev_h=150,
-                bev_w=150,
-                hidden_dim=512,
-                num_prior_layers=3,
-                use_rule_prior=True,
-                rule_prior_weight=0.5,
-            )
-        self.modulation = PriorGuidedModulation(**prior_head_cfg)
+        # Build text encoder based on type
+        encoder_type = text_encoder_cfg.pop('type', 'TextEncoder')
+        if encoder_type == 'CLIPTextEncoder':
+            self.text_encoder = CLIPTextEncoder(**text_encoder_cfg)
+        else:
+            # Default to BERT-based TextEncoder
+            self.text_encoder = TextEncoder(**text_encoder_cfg)
+
+        # Build modulation module based on type
+        if modulation_type == 'query_level':
+            # Query-level modulation (faster, more efficient)
+            if query_modulator_cfg is None:
+                query_modulator_cfg = dict(
+                    query_dim=256,
+                    text_dim=256,
+                    num_layers=1,
+                    use_residual=True,
+                )
+            self.query_modulator = QueryModulator(**query_modulator_cfg)
+            self.modulation = None  # No dense BEV modulation
+
+            # Prior head is optional for query-level modulation
+            if prior_head_cfg is not None:
+                self.prior_head = PriorHead(**prior_head_cfg)
+            else:
+                self.prior_head = None  # No prior, cleaner and faster
+        else:
+            # Dense BEV modulation (original)
+            if prior_head_cfg is None:
+                prior_head_cfg = dict(
+                    text_dim=256,
+                    bev_channels=256,
+                    bev_h=150,
+                    bev_w=150,
+                    hidden_dim=512,
+                    num_prior_layers=3,
+                    use_rule_prior=True,
+                    rule_prior_weight=0.5,
+                )
+            self.modulation = PriorGuidedModulation(**prior_head_cfg)
+            self.query_modulator = None
+            self.prior_head = None
 
         # MQA head is optional (not used for detection-only training)
         if mqa_head_cfg is not None:
@@ -157,6 +191,11 @@ class BEVFormerMQA(MVXTwoStageDetector):
             'prev_pos': 0,
             'prev_angle': 0,
         }
+
+        # Text embedding cache for speed optimization
+        # Since questions are limited in MQA dataset, caching avoids redundant text encoding
+        self.text_cache = {}
+        self.text_cache_enabled = True  # Can disable for debugging
     
     def _freeze_modules(self):
         """Freeze specified modules."""
@@ -411,32 +450,84 @@ class BEVFormerMQA(MVXTwoStageDetector):
             C = bev_embed_clean.shape[2]
             bev_feat = bev_embed_clean.permute(0, 2, 1).contiguous().reshape(B, C, bev_h, bev_w)
 
-        # 3. Encode question text
+        # 3. Encode question text (with caching for speed)
         if isinstance(question, (list, tuple)):
             questions = question
         else:
             questions = [question]
-        text_embedding = self.text_encoder(questions)  # [B, D]
 
-        # 4. Language-guided BEV feature modulation
-        # This is the core: language modulates BEV to improve detection
-        bev_feat_modulated, prior = self.modulation(
-            bev_feat,
-            text_embedding,
-            camera_prior_mask
-        )  # [B, C, H, W], [B, H, W]
+        # Text caching: avoid redundant encoding of repeated questions
+        if self.text_cache_enabled:
+            text_embeddings = []
+            uncached_questions = []
+            uncached_indices = []
 
-        # 5. Convert modulated BEV to the transformer's expected format: [B, HW, C]
-        bev_modulated_embed = bev_feat_modulated.reshape(B, C, hw).permute(0, 2, 1).contiguous()
+            for i, q in enumerate(questions):
+                if q in self.text_cache:
+                    text_embeddings.append(self.text_cache[q])
+                else:
+                    uncached_questions.append(q)
+                    uncached_indices.append(i)
+                    text_embeddings.append(None)  # Placeholder
 
-        # 6. Run detection with modulated BEV, without recomputing encoder BEV
-        outs = self.pts_bbox_head(
-            img_feats,
-            img_metas,
-            prev_bev=prev_bev,
-            only_bev=False,
-            bev_embed=bev_modulated_embed,
-        )
+            # Encode only uncached questions
+            if uncached_questions:
+                uncached_embs = self.text_encoder(uncached_questions)  # [N_uncached, D]
+                for idx, emb in zip(uncached_indices, uncached_embs):
+                    self.text_cache[questions[idx]] = emb.detach()  # Cache it
+                    text_embeddings[idx] = emb
+
+            text_embedding = torch.stack(text_embeddings)  # [B, D]
+        else:
+            # No caching (for debugging)
+            text_embedding = self.text_encoder(questions)  # [B, D]
+
+        # 4. Language-guided modulation (query-level or dense BEV)
+        if self.modulation_type == 'query_level':
+            # Query-level modulation (faster)
+            # Get object queries
+            object_queries = self.pts_bbox_head.query_embedding.weight  # [N_q, 2*D]
+
+            # Modulate queries with language
+            modulated_queries = self.query_modulator(
+                object_queries.unsqueeze(0).expand(B, -1, -1),  # [B, N_q, 2*D]
+                text_embedding,  # [B, D]
+            )  # [B, N_q, 2*D]
+
+            # Generate prior for supervision (optional)
+            if self.prior_head is not None:
+                prior = self.prior_head(text_embedding, camera_prior_mask)  # [B, H, W]
+            else:
+                prior = None  # No prior generation (cleaner, faster)
+
+            # Run detection with modulated queries (no BEV modulation)
+            outs = self.pts_bbox_head(
+                img_feats,
+                img_metas,
+                prev_bev=prev_bev,
+                only_bev=False,
+                bev_embed=bev_embed_raw,  # Use raw BEV
+                object_query_embeds=modulated_queries,  # Pass modulated queries
+            )
+        else:
+            # Dense BEV modulation (original)
+            bev_feat_modulated, prior = self.modulation(
+                bev_feat,
+                text_embedding,
+                camera_prior_mask
+            )  # [B, C, H, W], [B, H, W]
+
+            # Convert modulated BEV to transformer format
+            bev_modulated_embed = bev_feat_modulated.reshape(B, C, hw).permute(0, 2, 1).contiguous()
+
+            # Run detection with modulated BEV
+            outs = self.pts_bbox_head(
+                img_feats,
+                img_metas,
+                prev_bev=prev_bev,
+                only_bev=False,
+                bev_embed=bev_modulated_embed,
+            )
 
         # 8. Compute detection loss (MAIN TASK)
         # Language modules are trained via detection loss backprop
@@ -453,11 +544,16 @@ class BEVFormerMQA(MVXTwoStageDetector):
                 )
             # Connect language modules to graph
             losses['loss_det_dummy'] = _connected_zero(outs['all_cls_scores']) + _connected_zero(outs['all_bbox_preds'])
-            losses['loss_lang_dummy'] = _connected_zero(bev_feat_modulated) + _connected_zero(prior)
+            if self.modulation_type == 'query_level':
+                losses['loss_lang_dummy'] = _connected_zero(modulated_queries)
+                if prior is not None:
+                    losses['loss_lang_dummy'] += _connected_zero(prior)
+            else:
+                losses['loss_lang_dummy'] = _connected_zero(bev_feat_modulated) + _connected_zero(prior)
 
         # 9. Optional: Prior supervision loss to guide language prior
-        # This helps language learn to focus on detection-relevant regions
-        if self.prior_supervision_head is not None and camera_prior_mask is not None:
+        # Only used if prior_head exists and prior was generated
+        if self.prior_supervision_head is not None and prior is not None and camera_prior_mask is not None:
             prior_losses = self.prior_supervision_head.loss(prior, camera_prior_mask)
             losses['loss_prior'] = prior_losses['loss_prior'] * self.loss_weight_prior
 
@@ -509,12 +605,35 @@ class BEVFormerMQA(MVXTwoStageDetector):
         self.prev_frame_info['prev_angle'] = tmp_angle
         self.prev_frame_info['prev_bev'] = bev_feat.permute(0, 2, 3, 1).reshape(bev_feat.shape[0], -1, bev_feat.shape[1])
         
-        # Encode text
+        # Encode text (with caching for speed)
         if isinstance(question, (list, tuple)):
             questions = question
         else:
             questions = [question]
-        text_embedding = self.text_encoder(questions)
+
+        # Text caching during inference
+        if self.text_cache_enabled:
+            text_embeddings = []
+            uncached_questions = []
+            uncached_indices = []
+
+            for i, q in enumerate(questions):
+                if q in self.text_cache:
+                    text_embeddings.append(self.text_cache[q])
+                else:
+                    uncached_questions.append(q)
+                    uncached_indices.append(i)
+                    text_embeddings.append(None)
+
+            if uncached_questions:
+                uncached_embs = self.text_encoder(uncached_questions)
+                for idx, emb in zip(uncached_indices, uncached_embs):
+                    self.text_cache[questions[idx]] = emb.detach()
+                    text_embeddings[idx] = emb
+
+            text_embedding = torch.stack(text_embeddings)
+        else:
+            text_embedding = self.text_encoder(questions)
 
         # Language-guided BEV feature modulation
         bev_feat_modulated, prior = self.modulation(

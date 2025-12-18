@@ -289,10 +289,23 @@ class PerceptionTransformer(BaseModule):
                 raise RuntimeError(
                     f'bev_embed must be [bs, HW, C] or [HW, bs, C]; got {tuple(bev_embed.shape)}, '
                     f'expected bs={bs}, HW={hw}')
-        query_pos, query = torch.split(
-            object_query_embed, self.embed_dims, dim=1)
-        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
-        query = query.unsqueeze(0).expand(bs, -1, -1)
+
+        # Handle both [N_q, D] and [bs, N_q, D] object_query_embed
+        if object_query_embed.dim() == 2:
+            # [N_q, D] - original format
+            query_pos, query = torch.split(
+                object_query_embed, self.embed_dims, dim=1)
+            query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
+            query = query.unsqueeze(0).expand(bs, -1, -1)
+        elif object_query_embed.dim() == 3:
+            # [bs, N_q, D] - pre-modulated queries
+            assert object_query_embed.shape[0] == bs, \
+                f'Batched object_query_embed must have batch size {bs}, got {object_query_embed.shape[0]}'
+            query_pos, query = torch.split(
+                object_query_embed, self.embed_dims, dim=2)
+            # Already batched, no need to expand
+        else:
+            raise RuntimeError(f'object_query_embed must be [N_q, D] or [bs, N_q, D]; got {tuple(object_query_embed.shape)}')
         reference_points = self.reference_points(query_pos)
         reference_points = reference_points.sigmoid()
         init_reference_out = reference_points
